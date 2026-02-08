@@ -8,7 +8,14 @@ const { loadPresets, savePreset, deletePreset } = require("./presets");
 const NotificationService = require('./notification-service');
 require("events").EventEmitter.defaultMaxListeners = 30;
 
-app.on('render-process-gone', (event, webContents, details) => { console.error('Render process gone:', event, webContents, details); });
+//app.on('render-process-gone', (event, webContents, details) => { console.error('Render process gone:', event, webContents, details); });
+
+app.on('render-process-gone', (event, webContents, details) => {
+  // console.error('Render process gone:', event, webContents, details);
+  // Optional: log to file instead if we ever need it
+  // const fs = require('fs');
+  // fs.appendFileSync('deepnest-errors.log', JSON.stringify({event, details}) + '\n');
+});
 
 remote.initialize();
 
