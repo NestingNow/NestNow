@@ -1,2 +1,7 @@
 npx lint-staged
-npm test
+
+# Only run full Playwright test suite in CI environments.
+# Local commits stay fast and are not blocked by Electron/Playwright setup.
+if [ "${CI}" = "true" ]; then
+  npm test
+fi

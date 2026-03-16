@@ -151,3 +151,70 @@ Content-Type: application/json
 ```
 
 Handle 4xx/5xx and parse the JSON response for placements and metrics.
+
+## Fresh machine checklist (local dev)
+
+On a new Mac or Windows machine:
+
+1. Install prerequisites from `BUILD.md` (Node 20+, build tools).
+2. Clone the repo:
+
+   ```sh
+   git clone https://github.com/NestingNow/NestNow.git
+   cd NestNow
+   ```
+
+3. Install dependencies (this also rebuilds native modules via `postinstall`):
+
+   ```sh
+   npm install
+   ```
+
+4. Build the app (TypeScript compile + Electron deps):
+
+   ```sh
+   npm run build
+   ```
+
+5. Start the server:
+
+   ```sh
+   npm run start:server
+   ```
+
+6. Confirm you see:
+
+   ```text
+   NestNow server mode: POST http://127.0.0.1:3001/nest
+   ```
+
+7. In your Keystone PMS `.env.local`, set (or confirm) `NESTNOW_URL`:
+
+   ```env
+   NESTNOW_URL=http://127.0.0.1:3001
+   ```
+
+At this point, Keystone PMS should be able to call the NestNow server on `POST /nest`.
+
+## Troubleshooting server startup
+
+- **Server does not log \"NestNow server mode\" or Keystone PMS requests hang**
+  - Stop NestNow.
+  - From the NestNow repo root, run:
+
+    ```sh
+    npm run clean
+    npm run build
+    npm run start:server
+    ```
+
+- **Still broken or you suspect a stale `node_modules`**
+
+  ```sh
+  npm run clean-all
+  npm install
+  npm run build
+  npm run start:server
+  ```
+
+If problems persist on a specific machine, verify Node version (`node -v`), that build tools are installed (see `BUILD.md`), and that no firewall is blocking `127.0.0.1:3001`.
