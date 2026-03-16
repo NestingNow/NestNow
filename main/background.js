@@ -52,7 +52,7 @@ window.onload = function () {
   */
   window.db = new NfpCache();
 
-  ipcRenderer.on('background-start', (event, data) => {
+  function handleNestRequest(event, data) {
     var index = data.index;
     var individual = data.individual;
 
@@ -173,24 +173,33 @@ window.onload = function () {
       var solution = ClipperLib.Clipper.MinkowskiSum(Ac, Bc, true);
       var clipperNfp;
 
-      var largestArea = null;
-      for (let i = 0; i < solution.length; i++) {
-        var n = toNestCoordinates(solution[i], 10000000); // Convert back using same scale factor to restore original coordinate precision
-        var sarea = -GeometryUtil.polygonArea(n);
-        if (largestArea === null || largestArea < sarea) {
-          clipperNfp = n;
-          largestArea = sarea;
+      if (!solution || !Array.isArray(solution) || solution.length === 0) {
+        clipperNfp = [];
+      } else {
+        var largestArea = null;
+        for (let i = 0; i < solution.length; i++) {
+          var n = toNestCoordinates(solution[i], 10000000); // Convert back using same scale factor to restore original coordinate precision
+          var sarea = -GeometryUtil.polygonArea(n);
+          if (largestArea === null || largestArea < sarea) {
+            clipperNfp = n;
+            largestArea = sarea;
+          }
+        }
+        if (clipperNfp === undefined) {
+          clipperNfp = [];
         }
       }
 
-      for (let i = 0; i < clipperNfp.length; i++) {
-        clipperNfp[i].x += B[0].x;
-        clipperNfp[i].y += B[0].y;
+      if (Array.isArray(clipperNfp) && clipperNfp.length > 0) {
+        for (let i = 0; i < clipperNfp.length; i++) {
+          clipperNfp[i].x += B[0].x;
+          clipperNfp[i].y += B[0].y;
+        }
       }
 
       pair.A = null;
       pair.B = null;
-      pair.nfp = clipperNfp;
+      pair.nfp = Array.isArray(clipperNfp) ? clipperNfp : [];
       return pair;
 
       function toClipperCoordinates(polygon) {
@@ -243,14 +252,65 @@ window.onload = function () {
       ipcRenderer.send('test', [data.sheets, parts, data.config, index]);
       var placement = placeParts(data.sheets, parts, data.config, index);
 
+      if (placement == null) {
+        ipcRenderer.send(data._responseChannel || 'background-response', { error: 'Placement failed', fitness: null });
+        return;
+      }
       placement.index = data.index;
-      ipcRenderer.send('background-response', placement);
+      ipcRenderer.send(data._responseChannel || 'background-response', placement);
     }
 
     // console.time('Total');
 
-
-    if (pairs.length > 0) {
+    // Server mode: run NFP synchronously in main thread (no workers) so we always send server-nest-response
+    if (data._serverMode && pairs.length > 0) {
+      try {
+        var processed = [];
+        for (let i = 0; i < pairs.length; i++) {
+          processed.push(process(pairs[i]));
+        }
+        function getPart(source) {
+          for (let k = 0; k < parts.length; k++) {
+            if (parts[k].source == source) return parts[k];
+          }
+          return null;
+        }
+        for (let i = 0; i < processed.length; i++) {
+          var A = getPart(processed[i].Asource);
+          var B = getPart(processed[i].Bsource);
+          var Achildren = [];
+          if (A.children) {
+            for (let j = 0; j < A.children.length; j++) {
+              Achildren.push(rotatePolygon(A.children[j], processed[i].Arotation));
+            }
+          }
+          if (Achildren.length > 0) {
+            var Brotated = rotatePolygon(B, processed[i].Brotation);
+            var bbounds = GeometryUtil.getPolygonBounds(Brotated);
+            var cnfp = [];
+            for (let j = 0; j < Achildren.length; j++) {
+              var cbounds = GeometryUtil.getPolygonBounds(Achildren[j]);
+              if (cbounds.width > bbounds.width && cbounds.height > bbounds.height) {
+                var n = getInnerNfp(Achildren[j], Brotated, data.config);
+                if (n && n.length > 0) cnfp = cnfp.concat(n);
+              }
+            }
+            processed[i].nfp.children = cnfp;
+          }
+          var doc = {
+            A: processed[i].Asource,
+            B: processed[i].Bsource,
+            Arotation: processed[i].Arotation,
+            Brotation: processed[i].Brotation,
+            nfp: processed[i].nfp
+          };
+          window.db.insert(doc);
+        }
+        sync();
+      } catch (e) {
+        ipcRenderer.send(data._responseChannel || 'background-response', { error: String(e && e.message) || String(e), fitness: null });
+      }
+    } else if (pairs.length > 0) {
       var p = new Parallel(pairs, {
         evalPath: '../build/util/eval.js',
         synchronous: false
@@ -324,12 +384,19 @@ window.onload = function () {
         // console.timeEnd('Total');
         // console.log('before sync');
         sync();
+      }).then(undefined, function (e) {
+        // Parallel workers failed (e.g. Worker/evalPath in Electron); send error so main returns 500 instead of 5-min timeout
+        ipcRenderer.send(data._responseChannel || 'background-response', { error: String(e && e.message) || String(e), fitness: null });
       });
     }
     else {
       sync();
     }
-  });
+  }
+
+  ipcRenderer.on('background-start', handleNestRequest);
+  ipcRenderer.on('server-nest-request', handleNestRequest);
+  ipcRenderer.send('server-background-ready');
 };
 
 /**

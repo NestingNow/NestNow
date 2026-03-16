@@ -16,6 +16,9 @@ export class NfpCache {
   private db: Record<string, Nfp | Nfp[]> = {};
 
   private clone(nfp: Nfp): Nfp {
+    if (!Array.isArray(nfp)) {
+      return [] as Nfp;
+    }
     const newnfp: Nfp = nfp.map((p) => new Point(p.x, p.y));
     if (nfp.children && nfp.children.length > 0) {
       newnfp.children = nfp.children.map((child) =>
@@ -29,10 +32,13 @@ export class NfpCache {
     if (!inner) {
       return this.clone(nfp as Nfp);
     }
+    if (!Array.isArray(nfp)) {
+      return [];
+    }
     return (nfp as Nfp[]).map((n) => this.clone(n));
   }
 
-  private makeKey(doc: NfpDoc, _inner?: boolean): string {
+  private makeKey(doc: NfpDoc): string {
     const Arotation = parseInt(doc.Arotation as string);
     const Brotation = parseInt(doc.Brotation as string);
     const Aflipped = doc.Aflipped ? "1" : "0";
@@ -46,7 +52,7 @@ export class NfpCache {
   }
 
   find(obj: NfpDoc, inner?: boolean): Nfp | Nfp[] | null {
-    const key = this.makeKey(obj, inner);
+    const key = this.makeKey(obj);
     if (this.db[key]) {
       return this.cloneNfp(this.db[key], inner);
     }
@@ -54,7 +60,7 @@ export class NfpCache {
   }
 
   insert(obj: NfpDoc, inner?: boolean): void {
-    const key = this.makeKey(obj, inner);
+    const key = this.makeKey(obj);
     this.db[key] = this.cloneNfp(obj.nfp, inner);
   }
 

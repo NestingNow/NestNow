@@ -4,9 +4,13 @@ const fs = require("graceful-fs");
 const path = require("path");
 const os = require("os");
 const url = require("url");
+const http = require("http");
 const { loadPresets, savePreset, deletePreset } = require("./presets");
 const NotificationService = require('./notification-service');
+const { apiToBackgroundPayload, placementToApiResponse } = require("./server-adapter");
 require("events").EventEmitter.defaultMaxListeners = 30;
+
+const isServerMode = process.argv.includes("--server") || process.env.NESTNOW_SERVER === "1";
 
 app.on('render-process-gone', (event, webContents, details) => { console.error('Render process gone:', event, webContents, details); });
 
@@ -14,7 +18,8 @@ remote.initialize();
 
 app.commandLine.appendSwitch("--enable-precise-memory-info");
 crashReporter.start({ uploadToServer : false });
-console.log(crashReporter.getLastCrashReport());
+const lastCrash = crashReporter.getLastCrashReport();
+if (lastCrash) console.log(lastCrash);
 
 /*
 // main menu for mac
@@ -212,7 +217,7 @@ async function runNotificationCheck() {
 
 let winCount = 0;
 
-function createBackgroundWindows() {
+function createBackgroundWindows(onFirstReady) {
   //busyWindows = [];
   // used to have 8, now just 1 background window
   if (winCount < 1) {
@@ -243,7 +248,10 @@ function createBackgroundWindows() {
     back.once("ready-to-show", () => {
       //back.show();
       winCount++;
-      createBackgroundWindows();
+      if (typeof onFirstReady === "function") {
+        onFirstReady();
+      }
+      createBackgroundWindows(onFirstReady);
     });
     back.webContents.on('render-process-gone', (event, details) => { console.error('Render process gone:', event, details); });
     back.on('render-process-gone', (event) => { console.error('Render process gone:', event); });
@@ -254,23 +262,41 @@ function createBackgroundWindows() {
 // initialization and is ready to create browser windows.
 // Some APIs can only be used after this event occurs.
 app.on("ready", () => {
-  createMainWindow();
-  mainWindow.once("ready-to-show", () => {
-    mainWindow.show();
-    createBackgroundWindows();
-    
-    // Check for notifications after a short delay to ensure the app is fully loaded
-    setTimeout(async () => {
-      runNotificationCheck();
-    }, 3000); // 3 seconds
+  if (isServerMode) {
+    if (process.env.SAVE_PLACEMENTS_PATH !== undefined) {
+      global.NEST_DIRECTORY = process.env.SAVE_PLACEMENTS_PATH;
+    } else {
+      global.NEST_DIRECTORY = path.join(os.tmpdir(), "nest");
+    }
+    if (!fs.existsSync(global.NEST_DIRECTORY)) {
+      fs.mkdirSync(global.NEST_DIRECTORY);
+    }
+    ipcMain.once("server-background-ready", () => {
+      if (!serverStarted) {
+        serverStarted = true;
+        onServerBackgroundReady();
+      }
+    });
+    createBackgroundWindows(() => {});
+  } else {
+    createMainWindow();
+    mainWindow.once("ready-to-show", () => {
+      mainWindow.show();
+      createBackgroundWindows();
 
-    setInterval(async () => {
-      runNotificationCheck();
-    }, 30*60*1000); // every 30 minutes
-  });
-  mainWindow.on("closed", () => {
-    app.quit();
-  });
+      // Check for notifications after a short delay to ensure the app is fully loaded
+      setTimeout(async () => {
+        runNotificationCheck();
+      }, 3000); // 3 seconds
+
+      setInterval(async () => {
+        runNotificationCheck();
+      }, 30*60*1000); // every 30 minutes
+    });
+    mainWindow.on("closed", () => {
+      app.quit();
+    });
+  }
 });
 
 // Quit when all windows are closed.
@@ -299,6 +325,111 @@ app.on("before-quit", function () {
 //ipcMain.on('background-response', (event, payload) => mainWindow.webContents.send('background-response', payload));
 //ipcMain.on('background-start', (event, payload) => backgroundWindows[0].webContents.send('background-start', payload));
 
+// Server mode: pending resolve for the in-flight nest request (one at a time)
+let pendingNestResolve = null;
+let serverStarted = false;
+
+function onServerBackgroundReady() {
+  const port = parseInt(process.env.NESTNOW_PORT, 10) || 3001;
+  const server = http.createServer(async (req, res) => {
+    const setJson = (status, body) => {
+      res.setHeader("Content-Type", "application/json");
+      res.statusCode = status;
+      res.end(JSON.stringify(body));
+    };
+
+    if (req.method !== "POST" || req.url !== "/nest") {
+      setJson(404, { error: "Not found. Use POST /nest" });
+      return;
+    }
+
+    let body = "";
+    req.setEncoding("utf8");
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", () => {
+      handleNestRequest(body, setJson);
+    });
+  });
+
+  server.listen(port, "127.0.0.1", () => {
+    console.log("NestNow server mode: POST http://127.0.0.1:" + port + "/nest");
+  });
+}
+
+function handleNestRequest(body, setJson) {
+  let parsed;
+  try {
+    parsed = body ? JSON.parse(body) : {};
+  } catch (e) {
+    setJson(400, { error: "Invalid JSON" });
+    return;
+  }
+
+  const { payload, error: adapterError } = apiToBackgroundPayload(parsed);
+  if (adapterError) {
+    setJson(400, { error: adapterError });
+    return;
+  }
+
+  if (pendingNestResolve) {
+    setJson(503, { error: "Previous request still in progress" });
+    return;
+  }
+
+  const worker = backgroundWindows.find((w) => w && !w.isBusy);
+  if (!worker) {
+    setJson(503, { error: "No background worker available" });
+    return;
+  }
+
+  worker.isBusy = true;
+  const responsePromise = new Promise((resolve) => {
+    pendingNestResolve = (result) => {
+      pendingNestResolve = null;
+      worker.isBusy = false;
+      resolve(result);
+    };
+  });
+
+  const timeout = setTimeout(() => {
+    if (pendingNestResolve) {
+      console.error('Nest request timed out after 5 min');
+      pendingNestResolve(null);
+      worker.isBusy = false;
+    }
+  }, 300000);
+
+  worker.webContents.send("server-nest-request", { ...payload, _responseChannel: "server-nest-response", _serverMode: true });
+
+  responsePromise.then((result) => {
+    clearTimeout(timeout);
+    if (result && result.fitness != null) {
+      setJson(200, placementToApiResponse(result));
+    } else {
+      setJson(500, { error: (result && typeof result.error === "string" ? result.error : null) || "Nesting failed or timed out" });
+    }
+  }).catch((e) => {
+    clearTimeout(timeout);
+    worker.isBusy = false;
+    pendingNestResolve = null;
+    setJson(500, { error: String(e && e.message) || "Nesting failed" });
+  });
+}
+
+ipcMain.on("server-nest-response", function (event, payload) {
+  if (pendingNestResolve) {
+    pendingNestResolve(payload);
+  }
+  for (var i = 0; i < backgroundWindows.length; i++) {
+    try {
+      if (backgroundWindows[i] && backgroundWindows[i].webContents === event.sender) {
+        backgroundWindows[i].isBusy = false;
+        break;
+      }
+    } catch (ex) {}
+  }
+});
+
 ipcMain.on("background-start", function (event, payload) {
   console.log("starting background!");
   for (var i = 0; i < backgroundWindows.length; i++) {
@@ -315,7 +446,9 @@ ipcMain.on("background-response", function (event, payload) {
     // todo: hack to fix errors on app closing - should instead close workers when window is closed
     try {
       if (backgroundWindows[i].webContents == event.sender) {
-        mainWindow.webContents.send("background-response", payload);
+        if (mainWindow && mainWindow.webContents) {
+          mainWindow.webContents.send("background-response", payload);
+        }
         backgroundWindows[i].isBusy = false;
         break;
       }
