@@ -328,6 +328,52 @@ app.on("before-quit", function () {
 // Server mode: pending resolve for the in-flight nest request (one at a time)
 let pendingNestResolve = null;
 let serverStarted = false;
+let pendingNestWorker = null;
+let pendingNestTimeout = null;
+
+function parseRequestTimeoutMs() {
+  const raw = process.env.NESTNOW_REQUEST_TIMEOUT_MS;
+  const ms = raw != null ? parseInt(String(raw), 10) : NaN;
+  // Default 5 minutes; clamp to at least 1s to avoid immediate timeouts
+  if (!Number.isFinite(ms) || ms <= 0) return 300000;
+  return Math.max(1000, ms);
+}
+
+function clearInFlightLock() {
+  pendingNestResolve = null;
+  if (pendingNestTimeout) {
+    clearTimeout(pendingNestTimeout);
+    pendingNestTimeout = null;
+  }
+  if (pendingNestWorker) {
+    try {
+      pendingNestWorker.isBusy = false;
+    } catch (e) {}
+    pendingNestWorker = null;
+  }
+}
+
+function cancelInFlight(reason) {
+  if (!pendingNestResolve) return false;
+  const resolve = pendingNestResolve;
+  // Clear lock first so future requests can proceed even if resolve triggers errors
+  clearInFlightLock();
+  try {
+    resolve({ error: reason || "Stopped", fitness: null });
+  } catch (e) {}
+  // Reset workers to a clean state (mirrors background-stop behavior)
+  try {
+    for (var i = 0; i < backgroundWindows.length; i++) {
+      if (backgroundWindows[i]) {
+        backgroundWindows[i].destroy();
+        backgroundWindows[i] = null;
+      }
+    }
+    winCount = 0;
+    createBackgroundWindows(() => {});
+  } catch (e) {}
+  return true;
+}
 
 function onServerBackgroundReady() {
   const port = parseInt(process.env.NESTNOW_PORT, 10) || 3001;
@@ -338,8 +384,14 @@ function onServerBackgroundReady() {
       res.end(JSON.stringify(body));
     };
 
-    if (req.method !== "POST" || req.url !== "/nest") {
-      setJson(404, { error: "Not found. Use POST /nest" });
+    if (req.method !== "POST" || (req.url !== "/nest" && req.url !== "/stop")) {
+      setJson(404, { error: "Not found. Use POST /nest or POST /stop" });
+      return;
+    }
+
+    if (req.url === "/stop") {
+      const stopped = cancelInFlight("Stopped by client");
+      setJson(200, { ok: true, stopped });
       return;
     }
 
@@ -383,35 +435,33 @@ function handleNestRequest(body, setJson) {
   }
 
   worker.isBusy = true;
+  pendingNestWorker = worker;
   const responsePromise = new Promise((resolve) => {
     pendingNestResolve = (result) => {
-      pendingNestResolve = null;
-      worker.isBusy = false;
+      // Ensure in-flight state always clears, even on errors
+      clearInFlightLock();
       resolve(result);
     };
   });
 
-  const timeout = setTimeout(() => {
+  const timeoutMs = parseRequestTimeoutMs();
+  pendingNestTimeout = setTimeout(() => {
     if (pendingNestResolve) {
-      console.error('Nest request timed out after 5 min');
-      pendingNestResolve(null);
-      worker.isBusy = false;
+      console.error('Nest request timed out after ' + timeoutMs + ' ms');
+      cancelInFlight("Nesting timed out");
     }
-  }, 300000);
+  }, timeoutMs);
 
   worker.webContents.send("server-nest-request", { ...payload, _responseChannel: "server-nest-response", _serverMode: true });
 
   responsePromise.then((result) => {
-    clearTimeout(timeout);
     if (result && result.fitness != null) {
       setJson(200, placementToApiResponse(result));
     } else {
       setJson(500, { error: (result && typeof result.error === "string" ? result.error : null) || "Nesting failed or timed out" });
     }
   }).catch((e) => {
-    clearTimeout(timeout);
-    worker.isBusy = false;
-    pendingNestResolve = null;
+    clearInFlightLock();
     setJson(500, { error: String(e && e.message) || "Nesting failed" });
   });
 }

@@ -53,6 +53,13 @@ window.onload = function () {
   window.db = new NfpCache();
 
   function handleNestRequest(event, data) {
+    // Each HTTP /nest request must start with an empty NFP cache: keys are only
+    // source indices + rotations, not sheet geometry, so inner NFPs would be wrong
+    // on a second request with different sheet sizes (same source index 0).
+    if (data._serverMode) {
+      window.db = new NfpCache();
+    }
+
     var index = data.index;
     var individual = data.individual;
 
@@ -1070,9 +1077,37 @@ function placeParts(sheets, parts, config, nestindex) {
 
   var totalnum = parts.length;
   var totalsheetarea = 0;
+  var totalPlacedArea = 0;
 
   // total length of merged lines
   var totalMerged = 0;
+
+  function computeMetricsFromPlaced(placed, placements, config) {
+    var allpoints = [];
+    for (let m = 0; m < placed.length; m++) {
+      for (let n = 0; n < placed[m].length; n++) {
+        allpoints.push({
+          x: placed[m][n].x + placements[m].x,
+          y: placed[m][n].y + placements[m].y
+        });
+      }
+    }
+    if (allpoints.length === 0) {
+      return { minwidth: 0, minarea: 0 };
+    }
+    var allbounds = GeometryUtil.getPolygonBounds(allpoints);
+    var mw = allbounds.width;
+    var ma;
+    if (config.placementType == 'gravity') {
+      ma = allbounds.width * 5 + allbounds.height;
+    } else if (config.placementType == 'box') {
+      ma = allbounds.width * allbounds.height;
+    } else {
+      var hullPts = getHull(allpoints);
+      ma = hullPts ? Math.abs(GeometryUtil.polygonArea(hullPts)) : allbounds.width * allbounds.height;
+    }
+    return { minwidth: mw, minarea: ma };
+  }
 
   // rotate paths by given rotation
   var rotated = [];
@@ -1082,6 +1117,7 @@ function placeParts(sheets, parts, config, nestindex) {
     r.source = parts[i].source;
     r.id = parts[i].id;
     r.filename = parts[i].filename;
+    r.canRotate = parts[i].canRotate;
 
     rotated.push(r);
   }
@@ -1203,9 +1239,11 @@ function placeParts(sheets, parts, config, nestindex) {
 
       // inner NFP
       var sheetNfp = null;
+      var rotCount = part.canRotate === false ? 1 : config.rotations;
+      var rotStep = rotCount > 0 ? 360 / rotCount : 360;
       // try all possible rotations until it fits
       // (only do this for the first part of each sheet, to ensure that all parts that can be placed are, even if we have to to open a lot of sheets)
-      for (let j = 0; j < config.rotations; j++) {
+      for (let j = 0; j < rotCount; j++) {
         sheetNfp = getInnerNfp(sheet, part, config);
 
         if (sheetNfp) {
@@ -1214,11 +1252,12 @@ function placeParts(sheets, parts, config, nestindex) {
 
         // Rotate by equal angle steps (360° / number of allowed rotations) to try all configured orientations
         // This ensures even distribution of rotation attempts across the full circle
-        var r = rotatePolygon(part, 360 / config.rotations);
-        r.rotation = part.rotation + (360 / config.rotations);
+        var r = rotatePolygon(part, rotStep);
+        r.rotation = part.rotation + rotStep;
         r.source = part.source;
         r.id = part.id;
-        r.filename = part.filename
+        r.filename = part.filename;
+        r.canRotate = part.canRotate;
 
         // rotation is not in-place
         part = r;
@@ -1365,7 +1404,7 @@ function placeParts(sheets, parts, config, nestindex) {
                   // Try up to 4 different rotations (0°, 90°, 180°, 270°) to find the best fit for this hole
                   // These 90° increments cover all orthogonal orientations, maximizing chances of finding optimal fit
                   // while keeping computational cost reasonable (checking all 4 cardinal orientations)
-                  const rotationsToTry = [90, 180, 270];
+                  const rotationsToTry = part.canRotate === false ? [] : [90, 180, 270];
                   for (let rot of rotationsToTry) {
                     let newRotation = (part.rotation + rot) % 360;
                     const rotatedPart = rotatePolygon(part, newRotation);
@@ -1373,6 +1412,7 @@ function placeParts(sheets, parts, config, nestindex) {
                     rotatedPart.source = part.source;
                     rotatedPart.id = part.id;
                     rotatedPart.filename = part.filename;
+                    rotatedPart.canRotate = part.canRotate;
 
                     const rotatedBounds = GeometryUtil.getPolygonBounds(rotatedPart);
                     const rotatedIsWide = rotatedBounds.width > rotatedBounds.height;
@@ -2406,6 +2446,15 @@ function placeParts(sheets, parts, config, nestindex) {
     // The normalized width component (0.0008) is tiny compared to minarea, but it
     // provides a tiebreaker when comparing solutions with similar minarea values.
     // ============================================================================
+    for (let pi = 0; pi < placed.length; pi++) {
+      totalPlacedArea += Math.abs(GeometryUtil.polygonArea(placed[pi]));
+    }
+
+    if (minwidth == null || minarea == null) {
+      var computedSheet = computeMetricsFromPlaced(placed, placements, config);
+      minwidth = computedSheet.minwidth;
+      minarea = computedSheet.minarea;
+    }
     fitness += (minwidth / sheetarea) + minarea;
 
     for (let i = 0; i < placed.length; i++) {
@@ -2548,7 +2597,7 @@ function placeParts(sheets, parts, config, nestindex) {
 
   console.log('WATCH', allplacements);
 
-  const utilisation = totalsheetarea > 0 ? (area / totalsheetarea) * 100 : 0;
+  const utilisation = totalsheetarea > 0 ? (totalPlacedArea / totalsheetarea) * 100 : 0;
   console.log(`Utilisation of the sheet(s): ${utilisation.toFixed(2)}%`);
 
   return { placements: allplacements, fitness: fitness, area: sheetarea, totalarea: totalsheetarea, mergedLength: totalMerged, utilisation: utilisation };

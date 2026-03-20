@@ -49,12 +49,14 @@ function buildPartPolygons(apiPart, startId, sourceIndex, filename) {
     return null;
   }
 
+  const canRotate = apiPart.canRotate !== false;
   const result = [];
   for (let q = 0; q < quantity; q++) {
     const poly = outline.map((p) => ({ x: Number(p.x), y: Number(p.y) }));
     poly.id = startId + q;
     poly.source = sourceIndex;
     poly.filename = filename || `part-${sourceIndex}`;
+    poly.canRotate = canRotate;
     poly.children = holes.length
       ? holes.map((hole) => hole.map((p) => ({ x: Number(p.x), y: Number(p.y) })))
       : undefined;

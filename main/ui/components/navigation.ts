@@ -1,6 +1,6 @@
 /**
  * Navigation Component
- * Handles tab switching logic for the sidebar navigation and dark mode toggle.
+ * Handles tab switching logic for the sidebar navigation and theme (dark-first / optional light).
  * Extracted from page.js (lines 168-199)
  */
 
@@ -32,14 +32,17 @@ const CSS_CLASSES = {
   ACTIVE: "active",
   DISABLED: "disabled",
   PAGE: "page",
-  DARK_MODE: "dark-mode",
+  /** Light theme (optional). Default shell is dark (PMS-aligned). */
+  LIGHT_MODE: "light-mode",
 } as const;
 
 /**
- * Local storage keys
+ * Local storage keys — dark-first: persist when user enables light UI.
  */
 const STORAGE_KEYS = {
-  DARK_MODE: "darkMode",
+  LIGHT_MODE: "nestnowLightMode",
+  /** Pre–dark-first migration */
+  LEGACY_DARK_MODE: "darkMode",
 } as const;
 
 /**
@@ -93,50 +96,73 @@ export class NavigationService {
   }
 
   /**
-   * Initialize dark mode from local storage preference
-   * Should be called early in the page lifecycle
+   * Migrate legacy `darkMode` ("true" = dark UI) to `nestnowLightMode` (inverse).
+   */
+  private migrateLegacyThemePreference(): void {
+    if (localStorage.getItem(STORAGE_KEYS.LIGHT_MODE) !== null) {
+      return;
+    }
+    const legacy = localStorage.getItem(STORAGE_KEYS.LEGACY_DARK_MODE);
+    if (legacy === null) {
+      return;
+    }
+    // Old darkMode true → dark shell → not light
+    localStorage.setItem(
+      STORAGE_KEYS.LIGHT_MODE,
+      legacy === "false" ? "true" : "false",
+    );
+    localStorage.removeItem(STORAGE_KEYS.LEGACY_DARK_MODE);
+  }
+
+  /**
+   * Initialize theme from local storage (default: dark shell)
    */
   initializeDarkMode(): void {
-    const darkMode = localStorage.getItem(STORAGE_KEYS.DARK_MODE) === "true";
-    if (darkMode) {
-      addClass(document.body, CSS_CLASSES.DARK_MODE);
+    this.migrateLegacyThemePreference();
+    if (localStorage.getItem(STORAGE_KEYS.LIGHT_MODE) === "true") {
+      addClass(document.body, CSS_CLASSES.LIGHT_MODE);
+    } else {
+      removeClass(document.body, CSS_CLASSES.LIGHT_MODE);
     }
   }
 
   /**
-   * Check if dark mode is currently enabled
-   * @returns True if dark mode is active
+   * @returns True when using the default dark shell (not light theme)
    */
   isDarkMode(): boolean {
-    return hasClass(document.body, CSS_CLASSES.DARK_MODE);
+    return !hasClass(document.body, CSS_CLASSES.LIGHT_MODE);
+  }
+
+  /** @returns True when light theme is active */
+  isLightMode(): boolean {
+    return hasClass(document.body, CSS_CLASSES.LIGHT_MODE);
   }
 
   /**
-   * Toggle dark mode on/off
-   * Persists the preference to local storage
+   * Toggle light theme (dark-first: adds/removes `light-mode` on body)
    */
   toggleDarkMode(): void {
-    toggleClass(document.body, CSS_CLASSES.DARK_MODE);
+    toggleClass(document.body, CSS_CLASSES.LIGHT_MODE);
     localStorage.setItem(
-      STORAGE_KEYS.DARK_MODE,
-      hasClass(document.body, CSS_CLASSES.DARK_MODE).toString()
+      STORAGE_KEYS.LIGHT_MODE,
+      hasClass(document.body, CSS_CLASSES.LIGHT_MODE).toString(),
     );
   }
 
   /**
-   * Enable dark mode explicitly
+   * Use dark shell (remove optional light theme)
    */
   enableDarkMode(): void {
-    addClass(document.body, CSS_CLASSES.DARK_MODE);
-    localStorage.setItem(STORAGE_KEYS.DARK_MODE, "true");
+    removeClass(document.body, CSS_CLASSES.LIGHT_MODE);
+    localStorage.setItem(STORAGE_KEYS.LIGHT_MODE, "false");
   }
 
   /**
-   * Disable dark mode explicitly
+   * Use light shell (add `light-mode`)
    */
   disableDarkMode(): void {
-    removeClass(document.body, CSS_CLASSES.DARK_MODE);
-    localStorage.setItem(STORAGE_KEYS.DARK_MODE, "false");
+    addClass(document.body, CSS_CLASSES.LIGHT_MODE);
+    localStorage.setItem(STORAGE_KEYS.LIGHT_MODE, "true");
   }
 
   /**
@@ -337,7 +363,7 @@ export class NavigationService {
  * @returns New NavigationService instance
  */
 export function createNavigationService(
-  options?: NavigationOptions
+  options?: NavigationOptions,
 ): NavigationService {
   return NavigationService.create(options);
 }
@@ -357,7 +383,7 @@ export function createNavigationService(
  * nav.switchToTab('config');
  */
 export function initializeNavigation(
-  resizeCallback?: ResizeCallback
+  resizeCallback?: ResizeCallback,
 ): NavigationService {
   const service = new NavigationService({ resizeCallback });
   service.initialize();
