@@ -20,6 +20,11 @@ const DEFAULT_CONFIG = {
   dxfImportScale: 1,
   dxfExportScale: 1,
   conversionServer: "https://converter.deepnest.app/convert",
+  /** Server-mode GA: population size (individuals per generation). */
+  populationSize: 10,
+  mutationRate: 10,
+  /** Server-mode GA: number of generations to evolve after the first evaluation pass. */
+  gaGenerations: 3,
 };
 
 /**

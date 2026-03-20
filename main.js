@@ -8,6 +8,7 @@ const http = require("http");
 const { loadPresets, savePreset, deletePreset } = require("./presets");
 const NotificationService = require('./notification-service');
 const { apiToBackgroundPayload, placementToApiResponse } = require("./server-adapter");
+const { runServerGeneticNesting } = require("./server-ga");
 require("events").EventEmitter.defaultMaxListeners = 30;
 
 const isServerMode = process.argv.includes("--server") || process.env.NESTNOW_SERVER === "1";
@@ -408,6 +409,44 @@ function onServerBackgroundReady() {
   });
 }
 
+function runSingleNestRequest(worker, payload, timeoutOverrideMs) {
+  return new Promise((resolve, reject) => {
+    if (pendingNestResolve) {
+      reject(new Error("Nest pipeline busy"));
+      return;
+    }
+    if (pendingNestTimeout) {
+      clearTimeout(pendingNestTimeout);
+      pendingNestTimeout = null;
+    }
+    const timeoutMs =
+      timeoutOverrideMs != null &&
+      Number.isFinite(timeoutOverrideMs) &&
+      timeoutOverrideMs >= 1000
+        ? Math.min(3600000, timeoutOverrideMs)
+        : parseRequestTimeoutMs();
+    pendingNestTimeout = setTimeout(() => {
+      if (pendingNestResolve) {
+        console.error("Nest request timed out after " + timeoutMs + " ms");
+        cancelInFlight("Nesting timed out");
+      }
+    }, timeoutMs);
+
+    worker.isBusy = true;
+    pendingNestWorker = worker;
+    pendingNestResolve = (result) => {
+      clearInFlightLock();
+      resolve(result);
+    };
+
+    worker.webContents.send("server-nest-request", {
+      ...payload,
+      _responseChannel: "server-nest-response",
+      _serverMode: true,
+    });
+  });
+}
+
 function handleNestRequest(body, setJson) {
   let parsed;
   try {
@@ -415,6 +454,16 @@ function handleNestRequest(body, setJson) {
   } catch (e) {
     setJson(400, { error: "Invalid JSON" });
     return;
+  }
+
+  let requestTimeoutOverrideMs = null;
+  if (parsed && typeof parsed === "object" && "requestTimeoutMs" in parsed) {
+    const rawT = parsed.requestTimeoutMs;
+    const t =
+      typeof rawT === "number" ? rawT : parseInt(String(rawT), 10);
+    if (Number.isFinite(t) && t >= 1000) {
+      requestTimeoutOverrideMs = Math.min(3600000, t);
+    }
   }
 
   const { payload, error: adapterError } = apiToBackgroundPayload(parsed);
@@ -434,36 +483,30 @@ function handleNestRequest(body, setJson) {
     return;
   }
 
-  worker.isBusy = true;
-  pendingNestWorker = worker;
-  const responsePromise = new Promise((resolve) => {
-    pendingNestResolve = (result) => {
-      // Ensure in-flight state always clears, even on errors
+  runServerGeneticNesting(payload, {
+    runSingle: (p) =>
+      runSingleNestRequest(worker, p, requestTimeoutOverrideMs),
+    onProgress: (s) => {
+      if (process.env.NESTNOW_SERVER_PROGRESS === "1") {
+        console.log("[nest GA]", s);
+      }
+    },
+  })
+    .then(({ result }) => {
+      if (result && result.fitness != null) {
+        setJson(200, placementToApiResponse(result));
+      } else {
+        setJson(500, {
+          error:
+            (result && typeof result.error === "string" ? result.error : null) ||
+            "Nesting failed or timed out",
+        });
+      }
+    })
+    .catch((e) => {
       clearInFlightLock();
-      resolve(result);
-    };
-  });
-
-  const timeoutMs = parseRequestTimeoutMs();
-  pendingNestTimeout = setTimeout(() => {
-    if (pendingNestResolve) {
-      console.error('Nest request timed out after ' + timeoutMs + ' ms');
-      cancelInFlight("Nesting timed out");
-    }
-  }, timeoutMs);
-
-  worker.webContents.send("server-nest-request", { ...payload, _responseChannel: "server-nest-response", _serverMode: true });
-
-  responsePromise.then((result) => {
-    if (result && result.fitness != null) {
-      setJson(200, placementToApiResponse(result));
-    } else {
-      setJson(500, { error: (result && typeof result.error === "string" ? result.error : null) || "Nesting failed or timed out" });
-    }
-  }).catch((e) => {
-    clearInFlightLock();
-    setJson(500, { error: String(e && e.message) || "Nesting failed" });
-  });
+      setJson(500, { error: String((e && e.message) || e) || "Nesting failed" });
+    });
 }
 
 ipcMain.on("server-nest-response", function (event, payload) {

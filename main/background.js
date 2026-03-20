@@ -52,6 +52,58 @@ window.onload = function () {
   */
   window.db = new NfpCache();
 
+  /** Clipper offset +0.5*spacing on part outlines for server mode (matches non-sheet path in deepnest.start). */
+  function offsetPolygonSpacing(poly, delta, config) {
+    if (!delta || GeometryUtil.almostEqual(delta, 0)) return null;
+    var clipperScale = (config && config.clipperScale) || 10000000;
+    var p = [];
+    for (var i = 0; i < poly.length; i++) {
+      p.push({ X: poly[i].x, Y: poly[i].y });
+    }
+    ClipperLib.JS.ScaleUpPath(p, clipperScale);
+    var miterLimit = 4;
+    var co = new ClipperLib.ClipperOffset(
+      miterLimit,
+      config.curveTolerance * clipperScale
+    );
+    co.AddPath(p, ClipperLib.JoinType.jtMiter, ClipperLib.EndType.etClosedPolygon);
+    var newpaths = new ClipperLib.Paths();
+    co.Execute(newpaths, delta * clipperScale);
+    if (!newpaths.length) return null;
+    var best = null;
+    var bestArea = null;
+    for (var i = 0; i < newpaths.length; i++) {
+      var n = [];
+      for (var j = 0; j < newpaths[i].length; j++) {
+        n.push({
+          x: newpaths[i][j].X / clipperScale,
+          y: newpaths[i][j].Y / clipperScale,
+        });
+      }
+      var a = Math.abs(GeometryUtil.polygonArea(n));
+      if (best === null || a > bestArea) {
+        best = n;
+        bestArea = a;
+      }
+    }
+    return best;
+  }
+
+  function applyServerModePartSpacing(parts, config) {
+    var sp = Number(config && config.spacing);
+    if (!sp || sp <= 0 || GeometryUtil.almostEqual(sp, 0)) return;
+    var delta = 0.5 * sp;
+    for (var i = 0; i < parts.length; i++) {
+      var o = offsetPolygonSpacing(parts[i], delta, config);
+      if (o && o.length >= 3) {
+        parts[i].splice(0, parts[i].length);
+        for (var k = 0; k < o.length; k++) {
+          parts[i].push(o[k]);
+        }
+      }
+    }
+  }
+
   function handleNestRequest(event, data) {
     // Each HTTP /nest request must start with an empty NFP cache: keys are only
     // source indices + rotations, not sheet geometry, so inner NFPs would be wrong
@@ -87,6 +139,12 @@ window.onload = function () {
       _sheets[i].children = data.sheetchildren[i];
     }
     data.sheets = _sheets;
+
+    if (data._serverMode) {
+      applyServerModePartSpacing(parts, data.config);
+    }
+
+    var pairClipScale = (data.config && data.config.clipperScale) || 10000000;
 
     // preprocess
     var pairs = [];
@@ -165,9 +223,9 @@ window.onload = function () {
       var clipper = new ClipperLib.Clipper();
 
       var Ac = toClipperCoordinates(A);
-      ClipperLib.JS.ScaleUpPath(Ac, 10000000); // Scale factor of 10^7 ensures integer precision for floating point coordinates while avoiding overflow
+      ClipperLib.JS.ScaleUpPath(Ac, pairClipScale);
       var Bc = toClipperCoordinates(B);
-      ClipperLib.JS.ScaleUpPath(Bc, 10000000); // Must use same scale factor for both polygons to maintain relative positioning
+      ClipperLib.JS.ScaleUpPath(Bc, pairClipScale);
       // Negate polygon B coordinates to compute Minkowski difference (A - B) instead of sum (A + B)
       // Mathematical basis: NFP(A,B) = A ⊕ (-B) where ⊕ is Minkowski sum
       // The negation converts the sum operation into a difference, giving us the no-fit polygon
@@ -185,7 +243,7 @@ window.onload = function () {
       } else {
         var largestArea = null;
         for (let i = 0; i < solution.length; i++) {
-          var n = toNestCoordinates(solution[i], 10000000); // Convert back using same scale factor to restore original coordinate precision
+          var n = toNestCoordinates(solution[i], pairClipScale);
           var sarea = -GeometryUtil.polygonArea(n);
           if (largestArea === null || largestArea < sarea) {
             clipperNfp = n;
@@ -779,8 +837,9 @@ function rotatePolygon(polygon, degrees) {
  *
  * Computation method: NFP = A ⊕ (-B) where ⊕ is Minkowski sum and -B is B with negated coordinates.
  */
-function getOuterNfp(A, B, inside) {
+function getOuterNfp(A, B, inside, config) {
   var nfp;
+  var pairClipScale = (config && config.clipperScale) || 10000000;
 
   /*var numpoly = A.length + B.length;
   if(A.children && A.children.length > 0){
@@ -820,9 +879,9 @@ function getOuterNfp(A, B, inside) {
     // console.time('clipper');
 
     var Ac = toClipperCoordinates(A);
-    ClipperLib.JS.ScaleUpPath(Ac, 10000000); // Scale factor of 10^7 for integer precision without overflow
+    ClipperLib.JS.ScaleUpPath(Ac, pairClipScale);
     var Bc = toClipperCoordinates(B);
-    ClipperLib.JS.ScaleUpPath(Bc, 10000000); // Must match scale factor of A for consistent positioning
+    ClipperLib.JS.ScaleUpPath(Bc, pairClipScale);
     for (let i = 0; i < Bc.length; i++) {
       // Negate coordinates to compute Minkowski difference (A - B) instead of sum (A + B)
       // This gives us the NFP (no-fit polygon) representing all positions where B would overlap A
@@ -831,12 +890,12 @@ function getOuterNfp(A, B, inside) {
     }
     var solution = ClipperLib.Clipper.MinkowskiSum(Ac, Bc, true);
     //console.log(solution.length, solution);
-    //var clipperNfp = toNestCoordinates(solution[0], 10000000);
+    //var clipperNfp = toNestCoordinates(solution[0], pairClipScale);
     var clipperNfp;
 
     var largestArea = null;
     for (let i = 0; i < solution.length; i++) {
-      var n = toNestCoordinates(solution[i], 10000000); // Convert back using same scale factor
+      var n = toNestCoordinates(solution[i], pairClipScale);
       var sarea = -GeometryUtil.polygonArea(n);
       if (largestArea === null || largestArea < sarea) {
         clipperNfp = n;
@@ -951,7 +1010,7 @@ function getInnerNfp(A, B, config) {
 
   var frame = getFrame(A);
 
-  var nfp = getOuterNfp(frame, B, true);
+  var nfp = getOuterNfp(frame, B, true, config);
 
   if (!nfp || !nfp.children || nfp.children.length == 0) {
     return null;
@@ -960,7 +1019,7 @@ function getInnerNfp(A, B, config) {
   var holes = [];
   if (A.children && A.children.length > 0) {
     for (let i = 0; i < A.children.length; i++) {
-      var hnfp = getOuterNfp(A.children[i], B);
+      var hnfp = getOuterNfp(A.children[i], B, false, config);
       if (hnfp) {
         holes.push(hnfp);
       }
@@ -1520,7 +1579,7 @@ function placeParts(sheets, parts, config, nestindex) {
       }
 
       for (let j = startindex; j < placed.length; j++) {
-        nfp = getOuterNfp(placed[j], part);
+        nfp = getOuterNfp(placed[j], part, false, config);
         // minkowski difference failed. very rare but could happen
         if (!nfp) {
           error = true;

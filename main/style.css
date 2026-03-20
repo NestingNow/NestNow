@@ -101,7 +101,8 @@ h3 {
   color: var(--text-secondary);
 }
 
-#home.page {
+/* Match #config: only the active tab uses flex; otherwise .page { display: none } applies */
+#home.page.active {
   display: flex;
   flex-direction: column;
   min-height: 0;

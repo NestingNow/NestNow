@@ -17,6 +17,7 @@
     "start:server": "electron . --server",
     "printenv": "cross-replace node -e \"console.log(process.env)\"",
     "test": "playwright test",
+    "test:server-ga": "node tests/server-ga-smoke.cjs",
     "build": "tsc && electron-builder install-app-deps",
     "clean": "node -e \"const fs=require('fs');const path=require('path');const rm=p=>{if(fs.existsSync(p)){fs.rmSync(p,{recursive:true,force:true});}};rm('build');rm('dist');\"",
     "clean-all": "node -e \"const fs=require('fs');const path=require('path');const rm=p=>{if(fs.existsSync(p)){fs.rmSync(p,{recursive:true,force:true});}};rm('build');rm('dist');rm('node_modules');rm('bin');\"",
@@ -27,7 +28,7 @@
     "dist-all-signed": "npm run clean-all && npm install && npm run build && npm run build-dist-signed",
     "prepare": "husky || true",
     "precommit": "lint-staged",
-    "postinstall": "electron-builder install-app-deps",
+    "postinstall": "electron-builder install-app-deps && patch-package",
     "pw:codegen": "node helper_scripts/playwright_codegen.js"
   },
   "husky": {
@@ -61,6 +62,7 @@
     "eslint": "^9.26.0",
     "husky": "^9.1.7",
     "lint-staged": "^15.5.2",
+    "patch-package": "^8.0.0",
     "prettier": "^3.5.3",
     "typescript": "^5.8.3",
     "typescript-eslint": "^8.32.0"
@@ -76,6 +78,8 @@
   },
   "files": [
     "main.js",
+    "server-ga.js",
+    "server-adapter.js",
     "main/**/*",
     "index.d.ts",
     "node_modules",

@@ -17,6 +17,7 @@ node_modules/
 /playwright-report/
 /blob-report/
 /playwright/.cache/
+.playwright-electron-profile/
 /deepnest-v*
 /out
 /.env

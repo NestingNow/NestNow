@@ -1,31 +1,59 @@
 /*eslint no-empty-pattern: ["error", { "allowObjectPatternsAsParameters": true }]*/
 import {
   ConsoleMessage,
+  ElectronApplication,
+  Page,
   _electron as electron,
   expect,
   test,
 } from "@playwright/test";
 import { OpenDialogReturnValue } from "electron";
 import { existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { appendFile, mkdir, readdir, readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import path from "path";
 import { DeepNestConfig, NestingResult } from "../index";
 
+const repoRoot = path.resolve(__dirname, "..");
+
+// Isolated --user-data-dir: requestSingleInstanceLock() would otherwise quit when
+// another NestNow instance holds the default profile lock.
+// mainIndexWindow: pick the BrowserWindow that loaded main/index.html (not background.html).
+async function mainIndexWindow(
+  electronApp: ElectronApplication,
+): Promise<Page> {
+  let page: Page | undefined;
+  await expect(async () => {
+    const hit = electronApp
+      .windows()
+      .find((w) => w.url().includes("index.html"));
+    if (!hit) throw new Error("main window not loaded");
+    page = hit;
+  }).toPass({ timeout: 60_000 });
+  if (!page) throw new Error("main window not found");
+  return page;
+}
+
 // !process.env.CI && test.use({ launchOptions: { slowMo: 500 } });
 
 test("Nest", async ({}, testInfo) => {
   const { pipeConsole } = testInfo.config.metadata;
-  if (existsSync(testInfo.outputDir)) {
-    mkdir(testInfo.outputDir, { recursive: true });
+  if (!existsSync(testInfo.outputDir)) {
+    await mkdir(testInfo.outputDir, { recursive: true });
   }
 
+  const userDataDir = path.join(tmpdir(), `nestnow-playwright-${Date.now()}`);
+  // Fresh profile per run (see comment above mainIndexWindow).
+  await mkdir(userDataDir, { recursive: true });
+
   const electronApp = await electron.launch({
-    args: ["main.js"],
+    cwd: repoRoot,
+    args: [`--user-data-dir=${userDataDir}`, path.resolve(repoRoot, "main.js")],
     recordVideo: { dir: testInfo.outputDir },
   });
 
-  const mainWindow = await electronApp.firstWindow();
+  const mainWindow = await mainIndexWindow(electronApp);
 
   const consoleDump = testInfo.outputPath("console.txt");
   if (pipeConsole) {
@@ -71,6 +99,8 @@ test("Nest", async ({}, testInfo) => {
   }
   await test.step("Config", async () => {
     await mainWindow.locator("#config_tab").click();
+    await expect(mainWindow.locator("#config.page.active")).toBeVisible();
+    await expect(mainWindow.locator("#home")).toBeHidden();
     const configTab = mainWindow.locator("#config");
     await configTab.getByRole("link", { name: "set all to default" }).click();
     await test.step("units mm", () =>
@@ -220,11 +250,17 @@ test("Nest", async ({}, testInfo) => {
 
 test.afterAll(async ({}, testInfo) => {
   const { outputDir } = testInfo;
+  if (!existsSync(outputDir)) {
+    return;
+  }
+  const entries = await readdir(outputDir, { withFileTypes: true });
   await Promise.all(
-    (await readdir(outputDir)).map((file) => {
-      return testInfo.attach(file, {
-        path: path.resolve(outputDir, file),
-      });
-    }),
+    entries
+      .filter((e) => e.isFile())
+      .map((e) =>
+        testInfo.attach(e.name, {
+          path: path.resolve(outputDir, e.name),
+        }),
+      ),
   );
 });
