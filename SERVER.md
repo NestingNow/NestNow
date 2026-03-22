@@ -40,14 +40,20 @@ Accepts a JSON body with sheets, parts, and optional config. Returns a single ne
 
 | Field   | Type   | Required | Description |
 |--------|--------|----------|-------------|
-| sheets | array  | yes      | Sheet definitions (rectangular). |
+| sheets | array  | yes      | Sheet definitions (rectangle and/or polygon outline). |
 | parts  | array  | yes      | Part definitions (polygons). |
 | config | object | no       | Override nesting config (see below). |
 
-**Sheets** – Each element:
+**Sheets** – Each element is either:
 
-- `width` (number) – Sheet width in the same units as parts (e.g. mm).
-- `height` (number) – Sheet height.
+**A) Rectangle (legacy)** – `width` and `height` (both positive numbers, same units as parts). The server builds the standard closed polygon in **Nest coordinates**: origin at bottom-left, **y increases upward**, vertices in order bottom-left → bottom-right → top-right → top-left (same convention as part outlines).
+
+**B) Polygon remnant** – `outline`: array of at least three `{ x, y }` points forming a closed outer boundary (same coordinate system as parts). Optional `holes`: array of hole rings, each an array of `{ x, y }` points. The outline must have non-zero area and must not be self-intersecting.
+
+For each sheet you must provide **either** (`width` + `height`) **or** a valid `outline`. If both are present, **`outline` takes precedence**.
+
+Common to both:
+
 - `quantity` (number, optional) – Number of identical sheets (default: 1).
 
 **Parts** – Each element:
@@ -224,6 +230,18 @@ On a new Mac or Windows machine:
    ```
 
 At this point, Keystone PMS should be able to call the NestNow server on `POST /nest`.
+
+## Mixed rectangles + circles (regression)
+
+If `POST /nest` returns `500` with `lastEvalError` like `Cannot read properties of null (reading 'x')`, ensure you are on a build that includes the `placeParts` first-placement guard (do not push `null` into `placements` when the inner NFP has no usable vertices).
+
+With the server running locally:
+
+```sh
+npm run test:nest-circles-regression
+```
+
+By default the script **skips** if nothing is listening on the port. To fail CI when the server is missing or the nest fails, set `NESTNOW_CIRCLES_PROBE_REQUIRE=1`.
 
 ## Troubleshooting server startup
 

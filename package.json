@@ -18,6 +18,8 @@
     "printenv": "cross-replace node -e \"console.log(process.env)\"",
     "test": "playwright test",
     "test:server-ga": "node tests/server-ga-smoke.cjs",
+    "test:server-adapter": "node tests/server-adapter-polygon-sheets.cjs",
+    "test:nest-circles-regression": "node tests/nest-circles-regression.cjs",
     "benchmark:server": "node scripts/benchmark-server-nesting.cjs",
     "build": "tsc && electron-builder install-app-deps",
     "clean": "node -e \"const fs=require('fs');const path=require('path');const rm=p=>{if(fs.existsSync(p)){fs.rmSync(p,{recursive:true,force:true});}};rm('build');rm('dist');\"",

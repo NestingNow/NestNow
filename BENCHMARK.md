@@ -33,3 +33,20 @@ The script prints wall time for `POST /nest` and a one-line summary of the JSON 
 3. Time from **Start nest** until the UI shows a result, and compare to the script’s server measurement.
 
 This is a **manual** comparison; the script only automates the server path.
+
+## Polygon sheets (HTTP API)
+
+`POST /nest` accepts **`outline`** (and optional **`holes`**) per sheet instead of **`width`/`height`**; see [SERVER.md](./SERVER.md). Quick adapter checks:
+
+```sh
+npm run test:server-adapter
+```
+
+## Keystone dual-lane (module + grid)
+
+In **keystone-pms**, high–copy-count jobs may use a **module nest** (quantity 1 per SKU) plus client-side **grid expansion** instead of expanding every copy inside NestNow. To compare wall time manually:
+
+1. Same parts and sheet, **Strategy → Tight (full search)** → Generate Nest (note duration).
+2. Same data, **Strategy → Production (grid)** or **Auto** when it selects grid → Generate Nest.
+
+Expect the grid path to spend one short NestNow run plus instant expansion; tight path scales with total part instances in the engine.

@@ -92,13 +92,28 @@ window.onload = function () {
   function applyServerModePartSpacing(parts, config) {
     var sp = Number(config && config.spacing);
     if (!sp || sp <= 0 || GeometryUtil.almostEqual(sp, 0)) return;
-    var delta = 0.5 * sp;
+    // Match desktop deepnest.js offsetTree: expand outer by +0.5*spacing and
+    // offset each hole by the opposite sign so ring parts stay valid.
+    var deltaOut = 0.5 * sp;
     for (var i = 0; i < parts.length; i++) {
-      var o = offsetPolygonSpacing(parts[i], delta, config);
+      var o = offsetPolygonSpacing(parts[i], deltaOut, config);
       if (o && o.length >= 3) {
         parts[i].splice(0, parts[i].length);
         for (var k = 0; k < o.length; k++) {
           parts[i].push(o[k]);
+        }
+      }
+      if (parts[i].children && parts[i].children.length > 0) {
+        for (var h = 0; h < parts[i].children.length; h++) {
+          var hole = parts[i].children[h];
+          if (!hole || !hole.length) continue;
+          var hi = offsetPolygonSpacing(hole, -deltaOut, config);
+          if (hi && hi.length >= 3) {
+            hole.splice(0, hole.length);
+            for (var t = 0; t < hi.length; t++) {
+              hole.push(hi[t]);
+            }
+          }
         }
       }
     }
@@ -903,6 +918,10 @@ function getOuterNfp(A, B, inside, config) {
       }
     }
 
+    if (!clipperNfp || !clipperNfp.length) {
+      return null;
+    }
+
     for (let i = 0; i < clipperNfp.length; i++) {
       clipperNfp[i].x += B[0].x;
       clipperNfp[i].y += B[0].y;
@@ -1337,11 +1356,14 @@ function placeParts(sheets, parts, config, nestindex) {
       if (placed.length == 0) {
         // first placement, put it on the top left corner
         for (let j = 0; j < sheetNfp.length; j++) {
+          if (!sheetNfp[j] || !sheetNfp[j].length) continue;
           for (let k = 0; k < sheetNfp[j].length; k++) {
-            if (position === null || sheetNfp[j][k].x - part[0].x < position.x || (GeometryUtil.almostEqual(sheetNfp[j][k].x - part[0].x, position.x) && sheetNfp[j][k].y - part[0].y < position.y)) {
+            var sn = sheetNfp[j][k];
+            if (!sn || !Number.isFinite(sn.x) || !Number.isFinite(sn.y)) continue;
+            if (position === null || sn.x - part[0].x < position.x || (GeometryUtil.almostEqual(sn.x - part[0].x, position.x) && sn.y - part[0].y < position.y)) {
               position = {
-                x: sheetNfp[j][k].x - part[0].x,
-                y: sheetNfp[j][k].y - part[0].y,
+                x: sn.x - part[0].x,
+                y: sn.y - part[0].y,
                 id: part.id,
                 rotation: part.rotation,
                 source: part.source,
@@ -1351,7 +1373,10 @@ function placeParts(sheets, parts, config, nestindex) {
           }
         }
         if (position === null) {
-          // console.log(sheetNfp);
+          // Inner NFP existed but every sub-polygon was empty or had no usable
+          // vertices — do not push null into placements (later nfp shifts read
+          // placements[j].x and throw).
+          continue;
         }
         placements.push(position);
         placed.push(part);
@@ -1579,6 +1604,10 @@ function placeParts(sheets, parts, config, nestindex) {
       }
 
       for (let j = startindex; j < placed.length; j++) {
+        if (!placements[j] || !Number.isFinite(placements[j].x)) {
+          error = true;
+          break;
+        }
         nfp = getOuterNfp(placed[j], part, false, config);
         // minkowski difference failed. very rare but could happen
         if (!nfp) {
@@ -1587,18 +1616,30 @@ function placeParts(sheets, parts, config, nestindex) {
         }
         // shift to placed location
         for (let m = 0; m < nfp.length; m++) {
+          if (!nfp[m] || !Number.isFinite(nfp[m].x)) {
+            error = true;
+            break;
+          }
           nfp[m].x += placements[j].x;
           nfp[m].y += placements[j].y;
         }
+        if (error) break;
 
         if (nfp.children && nfp.children.length > 0) {
           for (let n = 0; n < nfp.children.length; n++) {
             for (let o = 0; o < nfp.children[n].length; o++) {
-              nfp.children[n][o].x += placements[j].x;
-              nfp.children[n][o].y += placements[j].y;
+              var ch = nfp.children[n][o];
+              if (!ch || !Number.isFinite(ch.x)) {
+                error = true;
+                break;
+              }
+              ch.x += placements[j].x;
+              ch.y += placements[j].y;
             }
+            if (error) break;
           }
         }
+        if (error) break;
 
         var clipperNfp = nfpToClipperCoordinates(nfp, config);
         clipper.AddPaths(clipperNfp, ClipperLib.PolyType.ptSubject, true);
@@ -1709,7 +1750,9 @@ function placeParts(sheets, parts, config, nestindex) {
       // Process regular sheet positions
       for (let j = 0; j < finalNfp.length; j++) {
         nf = finalNfp[j];
+        if (!nf || !nf.length) continue;
         for (let k = 0; k < nf.length; k++) {
+          if (!nf[k] || !Number.isFinite(nf[k].x) || !Number.isFinite(nf[k].y)) continue;
           shiftvector = {
             x: nf[k].x - part[0].x,
             y: nf[k].y - part[0].y,
