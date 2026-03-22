@@ -5,6 +5,8 @@
 
 "use strict";
 
+const { placementToApiResponse } = require("./server-adapter");
+
 function polygonAreaSigned(poly) {
   var a = 0;
   for (var i = 0, j = poly.length - 1; i < poly.length; j = i++) {
@@ -77,6 +79,89 @@ function payloadForIndividual(template, individual) {
     children: children,
     filenames: filenames,
   };
+}
+
+function clonePlacementResult(r) {
+  try {
+    return JSON.parse(JSON.stringify(r));
+  } catch (e) {
+    return r;
+  }
+}
+
+function parseTopK() {
+  var k = parseInt(process.env.NESTNOW_TOP_K || "5", 10);
+  if (!Number.isFinite(k) || k < 1) k = 5;
+  return Math.min(20, k);
+}
+
+/**
+ * Merge global best, per-round snapshots, and top-K eval hits for HTTP `candidates`.
+ * Sorted by fitness ascending, deduped by fitness epsilon, capped by NESTNOW_TOP_K.
+ */
+function mergeCandidateRawsForResponse(globalBest, topKRaw, roundRaw) {
+  var cap = parseTopK();
+  var all = [];
+  function add(r) {
+    if (r && typeof r.fitness === "number" && Number.isFinite(r.fitness)) {
+      all.push(r);
+    }
+  }
+  add(globalBest);
+  if (roundRaw) {
+    for (var i = 0; i < roundRaw.length; i++) {
+      add(roundRaw[i]);
+    }
+  }
+  if (topKRaw) {
+    for (var j = 0; j < topKRaw.length; j++) {
+      add(topKRaw[j]);
+    }
+  }
+  all.sort(function (a, b) {
+    return a.fitness - b.fitness;
+  });
+  var EPS = 1e-6;
+  var out = [];
+  var last = null;
+  for (var n = 0; n < all.length; n++) {
+    var f = all[n].fitness;
+    if (last !== null && Math.abs(f - last) < EPS) {
+      continue;
+    }
+    last = f;
+    out.push(all[n]);
+    if (out.length >= cap) {
+      break;
+    }
+  }
+  return out;
+}
+
+/**
+ * Max layout evaluations per HTTP /nest job.
+ * - If NESTNOW_GA_MAX_EVALS is set: use it (clamped), full override.
+ * - Else: allow up to populationSize × gaGenerations, capped at 10M, floor 500 (legacy small jobs).
+ */
+function resolveGaMaxEvals(pop, generations) {
+  var requested = pop * generations;
+  if (!Number.isFinite(requested) || requested < 1) requested = 1;
+  if (requested > Number.MAX_SAFE_INTEGER) {
+    requested = Number.MAX_SAFE_INTEGER;
+  }
+
+  var envRaw = process.env.NESTNOW_GA_MAX_EVALS;
+  if (envRaw != null && String(envRaw).trim() !== "") {
+    var fromEnv = parseInt(String(envRaw), 10);
+    if (!Number.isFinite(fromEnv) || fromEnv < 1) fromEnv = 500;
+    var HARD_MAX = 50000000;
+    return Math.min(fromEnv, HARD_MAX);
+  }
+
+  var DEFAULT_CEILING = 10000000;
+  var FLOOR = 500;
+  var capped = Math.min(requested, DEFAULT_CEILING);
+  return Math.max(FLOOR, capped);
 }
 
 class GeneticAlgorithm {
@@ -238,13 +323,64 @@ async function runServerGeneticNesting(templatePayload, options) {
     1,
     parseInt(String(config.gaGenerations != null ? config.gaGenerations : 3), 10) || 3
   );
-  var maxEval = parseInt(process.env.NESTNOW_GA_MAX_EVALS || "500", 10);
-  if (!Number.isFinite(maxEval) || maxEval < 1) maxEval = 500;
+  var maxEval = resolveGaMaxEvals(pop, generations);
   var useGA = pop >= 2 && process.env.NESTNOW_DISABLE_GA !== "1";
+
+  var topK = parseTopK();
+  var topList = [];
+  /** Last non-empty worker error from a failed evaluation (for HTTP 500 detail). */
+  var lastEvalError = "";
+
+  function recordEvalError(result) {
+    if (result && result.error != null) {
+      var em = String(result.error).trim();
+      if (em) lastEvalError = em;
+    }
+  }
+
+  function considerTopK(placementResult) {
+    if (!placementResult || placementResult.fitness == null) return;
+    topList.push({
+      fitness: placementResult.fitness,
+      raw: clonePlacementResult(placementResult),
+    });
+    topList.sort(function (a, b) {
+      return a.fitness - b.fitness;
+    });
+    if (topList.length > topK) {
+      topList = topList.slice(0, topK);
+    }
+  }
 
   if (!useGA) {
     var single = await runSingle(templatePayload);
-    return { result: single, evalCount: 1 };
+    recordEvalError(single);
+    var singleCand = [];
+    var singleRoundBests = [];
+    if (single && single.fitness != null) {
+      considerTopK(single);
+      singleCand = topList.map(function (e) {
+        return e.raw;
+      });
+      singleRoundBests.push(clonePlacementResult(single));
+      onProgress({
+        gen: 0,
+        generations: 1,
+        idx: 0,
+        pop: 1,
+        evalCount: 1,
+        bestSoFar: placementToApiResponse(single),
+      });
+    }
+    return {
+      result: single,
+      evalCount: 1,
+      candidates: singleCand,
+      roundBests: singleRoundBests,
+      lastEvalError: lastEvalError || undefined,
+      populationSize: 1,
+      gaGenerations: 1,
+    };
   }
 
   var template = nestTemplateFromPayload(templatePayload);
@@ -256,20 +392,24 @@ async function runServerGeneticNesting(templatePayload, options) {
   var bestResult = null;
   var bestFitness = Infinity;
   var evalCount = 0;
+  var roundBests = [];
 
   async function evaluateIndividual(individual, gen, idx) {
     if (evalCount >= maxEval) return;
     var payload = payloadForIndividual(template, individual);
     var result = await runSingle(payload);
     evalCount++;
+    var prevBest = bestFitness;
     if (result && result.fitness != null) {
       individual.fitness = result.fitness;
-      if (result.fitness < bestFitness) {
+      considerTopK(result);
+      if (result.fitness < prevBest) {
         bestFitness = result.fitness;
         bestResult = result;
       }
     } else {
       individual.fitness = Infinity;
+      recordEvalError(result);
     }
     onProgress({
       gen: gen,
@@ -286,13 +426,35 @@ async function runServerGeneticNesting(templatePayload, options) {
       if (evalCount >= maxEval) break;
       await evaluateIndividual(ga.population[i], gen, i);
     }
+    if (bestResult) {
+      roundBests.push(clonePlacementResult(bestResult));
+      onProgress({
+        gen: gen,
+        generations: generations,
+        idx: Math.max(0, ga.population.length - 1),
+        pop: ga.population.length,
+        evalCount: evalCount,
+        bestSoFar: placementToApiResponse(bestResult),
+      });
+    }
     if (evalCount >= maxEval) break;
     if (gen < generations - 1) {
       ga.generation();
     }
   }
 
-  return { result: bestResult, evalCount: evalCount };
+  var candidatesRaw = topList.map(function (e) {
+    return e.raw;
+  });
+  return {
+    result: bestResult,
+    evalCount: evalCount,
+    candidates: candidatesRaw,
+    roundBests: roundBests,
+    lastEvalError: lastEvalError || undefined,
+    populationSize: pop,
+    gaGenerations: generations,
+  };
 }
 
 module.exports = {
@@ -301,4 +463,6 @@ module.exports = {
   nestTemplateFromPayload,
   payloadForIndividual,
   clonePolygon,
+  mergeCandidateRawsForResponse,
+  parseTopK,
 };

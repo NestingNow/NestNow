@@ -8,7 +8,7 @@ const http = require("http");
 const { loadPresets, savePreset, deletePreset } = require("./presets");
 const NotificationService = require('./notification-service');
 const { apiToBackgroundPayload, placementToApiResponse } = require("./server-adapter");
-const { runServerGeneticNesting } = require("./server-ga");
+const { runServerGeneticNesting, mergeCandidateRawsForResponse } = require("./server-ga");
 require("events").EventEmitter.defaultMaxListeners = 30;
 
 const isServerMode = process.argv.includes("--server") || process.env.NESTNOW_SERVER === "1";
@@ -300,8 +300,10 @@ app.on("ready", () => {
   }
 });
 
-// Quit when all windows are closed.
+// Quit when all windows are closed (GUI mode only). Server mode uses hidden
+// workers that are destroyed/recreated on stop; must not quit the HTTP server.
 app.on("window-all-closed", function () {
+  if (isServerMode) return;
   app.quit();
 });
 
@@ -332,12 +334,57 @@ let serverStarted = false;
 let pendingNestWorker = null;
 let pendingNestTimeout = null;
 
+/** Last-known progress for GET /progress (server mode). */
+var nestHttpProgress = {
+  busy: false,
+  placement: null,
+  ga: null,
+  /** Genetic search: latest improved layout (same shape as POST /nest 200 body fields). */
+  bestSoFar: null,
+  updatedAt: 0,
+};
+
+function resetNestHttpProgressForNewJob() {
+  nestHttpProgress.busy = true;
+  nestHttpProgress.placement = null;
+  nestHttpProgress.ga = null;
+  nestHttpProgress.bestSoFar = null;
+  nestHttpProgress.updatedAt = Date.now();
+}
+
+function finishNestHttpProgress() {
+  nestHttpProgress.busy = false;
+  nestHttpProgress.bestSoFar = null;
+  nestHttpProgress.updatedAt = Date.now();
+}
+
+function setNestHttpCorsHeaders(req, res) {
+  var origin = req.headers.origin;
+  if (origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin);
+    res.setHeader("Vary", "Origin");
+  } else {
+    res.setHeader("Access-Control-Allow-Origin", "*");
+  }
+  res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
 function parseRequestTimeoutMs() {
   const raw = process.env.NESTNOW_REQUEST_TIMEOUT_MS;
   const ms = raw != null ? parseInt(String(raw), 10) : NaN;
-  // Default 5 minutes; clamp to at least 1s to avoid immediate timeouts
-  if (!Number.isFinite(ms) || ms <= 0) return 300000;
+  // Default 10 minutes — aligned with Keystone default “Max time per layout try” when body omits requestTimeoutMs
+  if (!Number.isFinite(ms) || ms <= 0) return 600000;
   return Math.max(1000, ms);
+}
+
+/** IT diagnostics: classify NestNow 500 responses (see Keystone “Details for IT”). */
+function nestFailureKindFromMessage(msg) {
+  var m = String(msg || "").toLowerCase();
+  if (m.includes("timed out") || m.includes("timeout")) return "timeout";
+  if (m.includes("stopped")) return "stopped";
+  if (m.includes("placement failed")) return "placement_failed";
+  return "no_layout";
 }
 
 function clearInFlightLock() {
@@ -379,18 +426,41 @@ function cancelInFlight(reason) {
 function onServerBackgroundReady() {
   const port = parseInt(process.env.NESTNOW_PORT, 10) || 3001;
   const server = http.createServer(async (req, res) => {
+    const pathname = (req.url || "").split("?")[0];
+
     const setJson = (status, body) => {
-      res.setHeader("Content-Type", "application/json");
+      setNestHttpCorsHeaders(req, res);
+      res.setHeader("Content-Type", "application/json; charset=utf-8");
       res.statusCode = status;
       res.end(JSON.stringify(body));
     };
 
-    if (req.method !== "POST" || (req.url !== "/nest" && req.url !== "/stop")) {
-      setJson(404, { error: "Not found. Use POST /nest or POST /stop" });
+    if (req.method === "OPTIONS") {
+      setNestHttpCorsHeaders(req, res);
+      res.statusCode = 204;
+      res.end();
       return;
     }
 
-    if (req.url === "/stop") {
+    if (req.method === "GET" && pathname === "/progress") {
+      setJson(200, {
+        busy: nestHttpProgress.busy,
+        placement: nestHttpProgress.placement,
+        ga: nestHttpProgress.ga,
+        bestSoFar: nestHttpProgress.bestSoFar,
+        updatedAt: nestHttpProgress.updatedAt,
+      });
+      return;
+    }
+
+    if (req.method !== "POST" || (pathname !== "/nest" && pathname !== "/stop")) {
+      setJson(404, {
+        error: "Not found. Use GET /progress, POST /nest, or POST /stop",
+      });
+      return;
+    }
+
+    if (pathname === "/stop") {
       const stopped = cancelInFlight("Stopped by client");
       setJson(200, { ok: true, stopped });
       return;
@@ -398,14 +468,20 @@ function onServerBackgroundReady() {
 
     let body = "";
     req.setEncoding("utf8");
-    req.on("data", (chunk) => { body += chunk; });
+    req.on("data", (chunk) => {
+      body += chunk;
+    });
     req.on("end", () => {
       handleNestRequest(body, setJson);
     });
   });
 
   server.listen(port, "127.0.0.1", () => {
-    console.log("NestNow server mode: POST http://127.0.0.1:" + port + "/nest");
+    console.log(
+      "NestNow server mode: http://127.0.0.1:" +
+        port +
+        " (GET /progress, POST /nest, POST /stop)",
+    );
   });
 }
 
@@ -483,29 +559,98 @@ function handleNestRequest(body, setJson) {
     return;
   }
 
+  resetNestHttpProgressForNewJob();
+  var nestJobStartedAt = Date.now();
   runServerGeneticNesting(payload, {
     runSingle: (p) =>
       runSingleNestRequest(worker, p, requestTimeoutOverrideMs),
     onProgress: (s) => {
+      nestHttpProgress.ga = {
+        gen: s.gen,
+        generations: s.generations,
+        idx: s.idx,
+        pop: s.pop,
+        evalCount: s.evalCount,
+      };
+      if (s.bestSoFar) {
+        nestHttpProgress.bestSoFar = s.bestSoFar;
+      }
+      nestHttpProgress.updatedAt = Date.now();
       if (process.env.NESTNOW_SERVER_PROGRESS === "1") {
         console.log("[nest GA]", s);
       }
     },
   })
-    .then(({ result }) => {
+    .then(
+      ({
+        result,
+        candidates,
+        roundBests,
+        lastEvalError,
+        evalCount,
+        populationSize,
+        gaGenerations,
+      }) => {
+      var nestNowDurationMs = Date.now() - nestJobStartedAt;
       if (result && result.fitness != null) {
-        setJson(200, placementToApiResponse(result));
+        var body = placementToApiResponse(result);
+        var mergedRaws = mergeCandidateRawsForResponse(
+          result,
+          candidates,
+          roundBests,
+        );
+        if (mergedRaws && mergedRaws.length > 0) {
+          body.candidates = mergedRaws.map(function (p) {
+            return placementToApiResponse(p);
+          });
+        }
+        setJson(200, body);
       } else {
-        setJson(500, {
-          error:
-            (result && typeof result.error === "string" ? result.error : null) ||
-            "Nesting failed or timed out",
-        });
+        var errMsg = "";
+        if (result && result.error != null) {
+          errMsg = String(result.error).trim();
+        }
+        if (!errMsg && lastEvalError) {
+          errMsg = String(lastEvalError).trim();
+        }
+        var failureKind = nestFailureKindFromMessage(errMsg);
+        var defaultNoLayout =
+          "No valid layout was produced. Check sheet size, spacing, and part geometry, or try Preview settings.";
+        var errBody = {
+          error: errMsg || defaultNoLayout,
+          failureKind: failureKind,
+          nestNowDurationMs: nestNowDurationMs,
+        };
+        if (typeof evalCount === "number" && Number.isFinite(evalCount)) {
+          errBody.evalCount = evalCount;
+        }
+        if (typeof populationSize === "number" && Number.isFinite(populationSize)) {
+          errBody.populationSize = populationSize;
+        }
+        if (typeof gaGenerations === "number" && Number.isFinite(gaGenerations)) {
+          errBody.gaGenerations = gaGenerations;
+        }
+        if (lastEvalError) {
+          errBody.lastEvalError = String(lastEvalError).trim();
+        }
+        var liveBest = nestHttpProgress.bestSoFar;
+        if (liveBest && typeof liveBest === "object") {
+          errBody.bestEffort = liveBest;
+        }
+        setJson(500, errBody);
       }
     })
     .catch((e) => {
       clearInFlightLock();
-      setJson(500, { error: String((e && e.message) || e) || "Nesting failed" });
+      var nestNowDurationMs = Date.now() - nestJobStartedAt;
+      setJson(500, {
+        error: String((e && e.message) || e) || "Nesting failed",
+        failureKind: "exception",
+        nestNowDurationMs: nestNowDurationMs,
+      });
+    })
+    .finally(() => {
+      finishNestHttpProgress();
     });
 }
 
@@ -552,9 +697,18 @@ ipcMain.on("background-response", function (event, payload) {
 });
 
 ipcMain.on("background-progress", function (event, payload) {
+  if (isServerMode && payload && typeof payload === "object") {
+    nestHttpProgress.placement = {
+      index: payload.index,
+      progress: payload.progress,
+    };
+    nestHttpProgress.updatedAt = Date.now();
+  }
   // todo: hack to fix errors on app closing - should instead close workers when window is closed
   try {
-    mainWindow.webContents.send("background-progress", payload);
+    if (mainWindow && mainWindow.webContents) {
+      mainWindow.webContents.send("background-progress", payload);
+    }
   } catch (ex) {
     // when shutting down while processes are running, this error can occur so ignore it for now.
   }

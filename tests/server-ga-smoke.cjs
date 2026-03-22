@@ -6,6 +6,7 @@ const {
   nestTemplateFromPayload,
   clonePolygon,
   runServerGeneticNesting,
+  mergeCandidateRawsForResponse,
 } = require("../server-ga.js");
 
 const samplePayload = {
@@ -81,15 +82,23 @@ assert.notStrictEqual(
 
 (async () => {
   let calls = 0;
-  const { result, evalCount } = await runServerGeneticNesting(samplePayload, {
-    runSingle: async () => {
-      calls++;
-      return { fitness: 100 - calls, placements: [], utilisation: 0 };
-    },
-  });
+  const { result, evalCount, candidates, roundBests, lastEvalError } =
+    await runServerGeneticNesting(samplePayload, {
+      runSingle: async () => {
+        calls++;
+        return { fitness: 100 - calls, placements: [], utilisation: 0 };
+      },
+    });
   assert.ok(calls >= 2, "GA should evaluate at least 2 individuals");
   assert.strictEqual(evalCount, calls);
   assert.strictEqual(result.fitness, 98);
+  assert.ok(Array.isArray(candidates) && candidates.length >= 1);
+  assert.strictEqual(candidates[0].fitness, 98);
+  assert.ok(Array.isArray(roundBests) && roundBests.length === 1);
+  assert.strictEqual(roundBests[0].fitness, 98);
+  const merged = mergeCandidateRawsForResponse(result, candidates, roundBests);
+  assert.strictEqual(merged[0].fitness, 98);
+  assert.strictEqual(lastEvalError, undefined);
   process.stdout.write("server-ga-smoke: ok\n");
 })().catch((e) => {
   console.error(e);

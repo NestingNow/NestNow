@@ -39,7 +39,7 @@
 
 ### Server mode (for integrations like Keystone PMS)
 
-See [`SERVER.md`](SERVER.md) for full details.
+See [`SERVER.md`](SERVER.md) for full details. For **timing comparisons** between server mode and the desktop app, see [`BENCHMARK.md`](BENCHMARK.md).
 
 Short version:
 
