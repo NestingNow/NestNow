@@ -34,6 +34,34 @@ function clonePolygon(poly) {
   return out;
 }
 
+/**
+ * JSON-serializable GA chromosome for Phase 2 seeding (part order + rotations).
+ * Each placement entry is { id, source?, outline } so HTTP JSON preserves id
+ * (plain ring arrays lose non-index properties) and Refine can reorder by id
+ * while using fresh geometry from the current request.
+ */
+function serializeChromosomeFromIndividual(individual) {
+  if (!individual || !individual.placement || !individual.rotation) return undefined;
+  return {
+    placement: individual.placement.map(function (poly) {
+      return {
+        id: poly.id,
+        source: poly.source,
+        outline: poly.map(function (pt) {
+          return { x: pt.x, y: pt.y };
+        }),
+      };
+    }),
+    rotation: individual.rotation.slice(),
+  };
+}
+
+function attachChromosomeToResult(result, individual) {
+  if (!result || result.fitness == null || !individual) return;
+  var c = serializeChromosomeFromIndividual(individual);
+  if (c) result.chromosome = c;
+}
+
 function sortAdamByAreaDesc(placement) {
   return placement.slice().sort(function (a, b) {
     return Math.abs(polygonAreaSigned(b)) - Math.abs(polygonAreaSigned(a));
@@ -90,8 +118,8 @@ function clonePlacementResult(r) {
 }
 
 function parseTopK() {
-  var k = parseInt(process.env.NESTNOW_TOP_K || "5", 10);
-  if (!Number.isFinite(k) || k < 1) k = 5;
+  var k = parseInt(process.env.NESTNOW_TOP_K || "3", 10);
+  if (!Number.isFinite(k) || k < 1) k = 3;
   return Math.min(20, k);
 }
 
@@ -165,19 +193,39 @@ function resolveGaMaxEvals(pop, generations) {
 }
 
 class GeneticAlgorithm {
-  constructor(adam, config) {
+  /**
+   * @param {Array} adam - Part polygons (order preserved when seeding Phase 2).
+   * @param {object} config
+   * @param {number[]|null|undefined} seedRotations - If length matches adam, used for population[0]; else random.
+   */
+  constructor(adam, config, seedRotations) {
     this.config = Object.assign(
       { populationSize: 10, mutationRate: 10, rotations: 4 },
       config || {}
     );
     if (!(this.config.rotations > 0)) this.config.rotations = 4;
 
-    var angles = [];
-    for (var i = 0; i < adam.length; i++) {
-      var angle =
-        Math.floor(Math.random() * this.config.rotations) *
-        (360 / this.config.rotations);
-      angles.push(angle);
+    var angles;
+    var rotCount = this.config.rotations;
+    var step = 360 / rotCount;
+    if (
+      seedRotations &&
+      seedRotations.length === adam.length
+    ) {
+      angles = seedRotations.map(function (r) {
+        var n = Number(r);
+        if (!Number.isFinite(n)) n = 0;
+        n = ((n % 360) + 360) % 360;
+        var q = Math.round(n / step) % rotCount;
+        return q * step;
+      });
+    } else {
+      angles = [];
+      for (var i = 0; i < adam.length; i++) {
+        angles.push(
+          Math.floor(Math.random() * rotCount) * step
+        );
+      }
     }
 
     this.population = [{ placement: adam, rotation: angles }];
@@ -358,6 +406,7 @@ async function runServerGeneticNesting(templatePayload, options) {
     var singleCand = [];
     var singleRoundBests = [];
     if (single && single.fitness != null) {
+      attachChromosomeToResult(single, templatePayload.individual);
       considerTopK(single);
       singleCand = topList.map(function (e) {
         return e.raw;
@@ -384,10 +433,17 @@ async function runServerGeneticNesting(templatePayload, options) {
   }
 
   var template = nestTemplateFromPayload(templatePayload);
-  var adam = sortAdamByAreaDesc(
-    templatePayload.individual.placement.map(clonePolygon)
-  );
-  var ga = new GeneticAlgorithm(adam, config);
+  var adam;
+  var seedRots = null;
+  if (templatePayload.seedChromosome) {
+    adam = templatePayload.individual.placement.map(clonePolygon);
+    seedRots = templatePayload.individual.rotation.slice();
+  } else {
+    adam = sortAdamByAreaDesc(
+      templatePayload.individual.placement.map(clonePolygon)
+    );
+  }
+  var ga = new GeneticAlgorithm(adam, config, seedRots);
 
   var bestResult = null;
   var bestFitness = Infinity;
@@ -402,6 +458,7 @@ async function runServerGeneticNesting(templatePayload, options) {
     var prevBest = bestFitness;
     if (result && result.fitness != null) {
       individual.fitness = result.fitness;
+      attachChromosomeToResult(result, individual);
       considerTopK(result);
       if (result.fitness < prevBest) {
         bestFitness = result.fitness;
@@ -463,6 +520,7 @@ module.exports = {
   nestTemplateFromPayload,
   payloadForIndividual,
   clonePolygon,
+  serializeChromosomeFromIndividual,
   mergeCandidateRawsForResponse,
   parseTopK,
 };

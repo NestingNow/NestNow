@@ -126,4 +126,71 @@ const bowtieSheet = {
   ok(payload.sheetchildren[0].length === 1, "one hole");
 }
 
+{
+  const { payload: built } = apiToBackgroundPayload(rectBody);
+  const pid = built.individual.placement[0].id;
+  const outline = rectBody.parts[0].outline;
+  const chromBody = {
+    sheets: rectBody.sheets,
+    parts: rectBody.parts,
+    chromosome: {
+      placement: [{ id: pid, outline: outline.map((p) => ({ x: p.x, y: p.y })) }],
+      rotation: [90],
+    },
+    config: { rotations: 4 },
+  };
+  const { payload, error } = apiToBackgroundPayload(chromBody);
+  ok(!error, error);
+  ok(payload.seedChromosome === true, "seedChromosome flag");
+  ok(payload.individual.rotation[0] === 90, "snapped rotation 90");
+}
+
+{
+  const twoPartsBody = {
+    sheets: rectBody.sheets,
+    parts: [
+      rectBody.parts[0],
+      {
+        outline: [
+          { x: 0, y: 0 },
+          { x: 5, y: 0 },
+          { x: 5, y: 5 },
+          { x: 0, y: 5 },
+        ],
+        quantity: 1,
+      },
+    ],
+  };
+  const { payload: p2 } = apiToBackgroundPayload(twoPartsBody);
+  const a = p2.individual.placement[0];
+  const b = p2.individual.placement[1];
+  const chromSwap = {
+    sheets: twoPartsBody.sheets,
+    parts: twoPartsBody.parts,
+    chromosome: {
+      placement: [
+        { id: b.id, outline: b.map((pt) => ({ x: pt.x, y: pt.y })) },
+        { id: a.id, outline: a.map((pt) => ({ x: pt.x, y: pt.y })) },
+      ],
+      rotation: [0, 180],
+    },
+    config: { rotations: 4 },
+  };
+  const { payload: swapped, error: e2 } = apiToBackgroundPayload(chromSwap);
+  ok(!e2, e2);
+  ok(swapped.individual.placement[0].id === b.id, "chromosome order: first slot is part b");
+  ok(swapped.individual.placement[1].id === a.id, "chromosome order: second slot is part a");
+  ok(swapped.individual.rotation[0] === 0 && swapped.individual.rotation[1] === 180, "rotations");
+}
+
+{
+  const bad = {
+    sheets: rectBody.sheets,
+    parts: rectBody.parts,
+    chromosome: { placement: [], rotation: [] },
+  };
+  const { error } = apiToBackgroundPayload(bad);
+  ok(!!error, "empty chromosome should fail");
+}
+
 console.log("server-adapter-polygon-sheets: ok");

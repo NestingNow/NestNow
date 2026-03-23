@@ -313,6 +313,20 @@ function apiToBackgroundPayload(body) {
     rotation: rotations,
   };
 
+  let seedChromosome = false;
+  if (body.chromosome != null && typeof body.chromosome === "object") {
+    const chromErr = mergeChromosomeOntoIndividual(
+      individual.placement,
+      individual.rotation,
+      body.chromosome,
+      config
+    );
+    if (chromErr.error) {
+      return { error: chromErr.error };
+    }
+    seedChromosome = true;
+  }
+
   const payload = {
     index: 0,
     sheets,
@@ -325,6 +339,7 @@ function apiToBackgroundPayload(body) {
     sources,
     children,
     filenames,
+    seedChromosome,
   };
 
   return { payload };
@@ -337,7 +352,7 @@ function placementToApiResponse(placement) {
   if (!placement) {
     return { error: "No placement result" };
   }
-  return {
+  var out = {
     fitness: placement.fitness != null ? placement.fitness : 0,
     area: placement.area ?? 0,
     totalarea: placement.totalarea ?? 0,
@@ -345,6 +360,117 @@ function placementToApiResponse(placement) {
     utilisation: placement.utilisation != null ? placement.utilisation : 0,
     placements: placement.placements || [],
   };
+  if (
+    placement.chromosome &&
+    placement.chromosome.placement &&
+    placement.chromosome.rotation
+  ) {
+    out.chromosome = placement.chromosome;
+  }
+  return out;
+}
+
+/**
+ * Snap rotation (degrees) to nearest allowed discrete angle for config.rotations.
+ */
+function snapRotationDegrees(deg, rotations) {
+  var n = Number(deg);
+  if (!Number.isFinite(n)) return 0;
+  var r = Math.max(1, Math.floor(Number(rotations)) || 4);
+  n = ((n % 360) + 360) % 360;
+  var step = 360 / r;
+  var q = Math.round(n / step) % r;
+  return q * step;
+}
+
+/** Deep-clone one built part polygon (vertices + metadata) from the current request. */
+function cloneBuiltPartPoly(base) {
+  var merged = [];
+  for (var j = 0; j < base.length; j++) {
+    merged.push({ x: Number(base[j].x), y: Number(base[j].y) });
+  }
+  merged.id = base.id;
+  merged.source = base.source;
+  merged.filename = base.filename;
+  merged.canRotate = base.canRotate;
+  if (base.children) {
+    merged.children = JSON.parse(JSON.stringify(base.children));
+  }
+  return merged;
+}
+
+/**
+ * Apply optional client chromosome (Phase 2 seed) onto built placement/rotation arrays.
+ * Prefers placement entries as { id, outline } (matches NestNow responses) so GA part
+ * order is restored by id; outline vertices always come from the current request build
+ * (avoids misaligned slots when JSON strips .id from plain ring arrays).
+ * Legacy: raw ring array at index i uses geometry from built placement[i].
+ * @returns {{ error?: string }}
+ */
+function mergeChromosomeOntoIndividual(placement, rotations, chromosome, config) {
+  var cPl = chromosome.placement;
+  var cRot = chromosome.rotation;
+  if (!Array.isArray(cPl) || !Array.isArray(cRot)) {
+    return { error: "chromosome.placement and chromosome.rotation must be arrays" };
+  }
+  if (cPl.length !== placement.length || cRot.length !== placement.length) {
+    return {
+      error:
+        "chromosome length mismatch (expected " +
+        placement.length +
+        " parts, got placement=" +
+        cPl.length +
+        " rotation=" +
+        cRot.length +
+        ")",
+    };
+  }
+  var rots = Math.max(1, Math.floor(Number(config && config.rotations)) || 4);
+
+  var byId = {};
+  for (var b = 0; b < placement.length; b++) {
+    var bp = placement[b];
+    if (bp && bp.id != null) {
+      byId[bp.id] = bp;
+    }
+  }
+
+  var newPlacement = [];
+  for (var i = 0; i < cPl.length; i++) {
+    var entry = cPl[i];
+    var base = null;
+
+    if (
+      entry &&
+      typeof entry === "object" &&
+      !Array.isArray(entry) &&
+      Array.isArray(entry.outline)
+    ) {
+      var eid = entry.id;
+      if (eid != null && byId[eid] != null) {
+        base = byId[eid];
+      }
+    } else if (Array.isArray(entry) && entry.length >= 3) {
+      base = placement[i];
+    }
+
+    if (!base || !Array.isArray(base) || base.length < 3) {
+      return {
+        error:
+          "chromosome.placement[" +
+          i +
+          "] must be { id, outline } with a known part id, or a legacy point ring; check NestNow version / chromosome shape",
+      };
+    }
+
+    newPlacement.push(cloneBuiltPartPoly(base));
+  }
+
+  for (var k = 0; k < newPlacement.length; k++) {
+    placement[k] = newPlacement[k];
+    rotations[k] = snapRotationDegrees(cRot[k], rots);
+  }
+  return {};
 }
 
 module.exports = {
